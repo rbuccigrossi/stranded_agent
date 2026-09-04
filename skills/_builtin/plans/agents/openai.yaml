@@ -1,0 +1,4 @@
+interface:
+  display_name: "Plans"
+  short_description: "Create and maintain visible task plans"
+  default_prompt: "Use the STRANDed plan tools to create or update a task plan."

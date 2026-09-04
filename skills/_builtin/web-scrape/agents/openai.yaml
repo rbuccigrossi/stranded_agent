@@ -1,0 +1,4 @@
+interface:
+  display_name: "Web Scrape"
+  short_description: "Fetch and extract readable web content"
+  default_prompt: "Fetch a public web page and extract its useful content."

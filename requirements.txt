@@ -1,0 +1,3 @@
+# The agent loop, tools, skills, approval interventions, and model providers.
+# The [openai] extra pulls in the OpenAI client used by the default provider.
+strands-agents[openai]>=1.54,<2

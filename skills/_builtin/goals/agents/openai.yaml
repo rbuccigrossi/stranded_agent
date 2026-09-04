@@ -1,0 +1,4 @@
+interface:
+  display_name: "Goals"
+  short_description: "Track objectives and bounded iteration"
+  default_prompt: "Use the STRANDed goal tools to track and complete the current objective."

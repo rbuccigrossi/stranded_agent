@@ -1,0 +1,4 @@
+interface:
+  display_name: "Web Search"
+  short_description: "Search the public web and return sources"
+  default_prompt: "Search the public web and cite the most useful sources."
