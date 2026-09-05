@@ -1,5 +1,6 @@
 __pycache__/
 *.py[cod]
+/config.json
 .stranded_sessions.json
 .stranded_web_sessions.json
 .venv/

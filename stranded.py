@@ -38,7 +38,24 @@ SKILLS_DIR = ROOT_DIR / "skills"
 BUILTIN_SKILLS_DIR = SKILLS_DIR / "_builtin"
 TOOLS_DIR = ROOT_DIR / "tools"
 SESSIONS_FILE = Path(os.getenv("STRANDED_SESSIONS", str(ROOT_DIR / ".stranded_sessions.json")))
-CONFIG_FILE = Path(os.getenv("STRANDED_CONFIG", str(ROOT_DIR / "config.json")))
+DEFAULT_CONFIG = ROOT_DIR / "config.json"
+EXAMPLE_CONFIG = ROOT_DIR / "config.json.example"
+
+
+def default_config_path() -> Path:
+    """Where to read the catalogue from.
+
+    ``config.json`` is yours and is not in version control, so a fresh clone has
+    only the committed example; fall back to it rather than failing to start. An
+    explicit ``STRANDED_CONFIG`` always wins, and is an error if it is missing.
+    """
+    explicit = os.getenv("STRANDED_CONFIG")
+    if explicit:
+        return Path(explicit)
+    return DEFAULT_CONFIG if DEFAULT_CONFIG.exists() else EXAMPLE_CONFIG
+
+
+CONFIG_FILE = default_config_path()
 
 DEFAULT_APPROVAL = "ask"
 APPROVAL_MODES = ("ask", "all", "deny")
@@ -561,6 +578,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def print_catalog() -> None:
     """Show what config.json offers, so --model and --reasoning can be typed correctly."""
+    print(color(90, f"# {CONFIG_FILE}"))
     default = AgentConfig().model
     for entry in models():
         marker = "  (default)" if entry["name"] == default else ""
@@ -573,14 +591,15 @@ def print_catalog() -> None:
 
 def main(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv)
-    if args.list:
-        print_catalog()
-        return
     try:
+        if args.list:
+            print_catalog()
+            return
         config = env_config(model=args.model, reasoning=args.reasoning,
                             approval_mode=args.approval)
     except (ValueError, OSError, json.JSONDecodeError) as error:
-        raise SystemExit(f"{error}\n(see {CONFIG_FILE}, or run --list)")
+        raise SystemExit(f"{error}\n(reading {CONFIG_FILE}; "
+                         f"copy {EXAMPLE_CONFIG.name} to start from the shipped catalogue)")
     session: Dict[str, Any] = {}
     if args.session or args.continue_session:
         session = pick_session() if args.session else next(

@@ -11,6 +11,18 @@ import stranded_tools
 from tests.scripted_model import ScriptedModel, text_turn, tool_turn
 
 
+def setUpModule():
+    """Run against the committed example, not whatever is in the developer's config.json."""
+    global _example
+    _example = patch.object(stranded, "CONFIG_FILE", stranded.EXAMPLE_CONFIG)
+    _example.start()
+
+
+def tearDownModule():
+    _example.stop()
+
+
+
 @contextlib.contextmanager
 def catalog_of(data):
     """Run the block against a config.json written just for this test."""
@@ -106,6 +118,37 @@ class ConfigTests(unittest.TestCase):
             overridden = stranded.env_config(reasoning="high", model=None)
             self.assertEqual(overridden.reasoning, "high")
             self.assertEqual(overridden.model, "GPT 5.6 Sol")
+
+
+class ConfigFileTests(unittest.TestCase):
+    """Where the catalogue is read from, given config.json is not in version control."""
+
+    def test_a_fresh_clone_falls_back_to_the_example(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("STRANDED_CONFIG", None)
+            missing = Path(tempfile.gettempdir()) / "stranded-no-such-config.json"
+            with patch.object(stranded, "DEFAULT_CONFIG", missing):
+                self.assertEqual(stranded.default_config_path(), stranded.EXAMPLE_CONFIG)
+            with patch.object(stranded, "DEFAULT_CONFIG", stranded.EXAMPLE_CONFIG):
+                self.assertEqual(stranded.default_config_path(), stranded.EXAMPLE_CONFIG)
+
+    def test_an_explicit_path_always_wins(self):
+        with patch.dict(os.environ, {"STRANDED_CONFIG": "/somewhere/else.json"}):
+            self.assertEqual(stranded.default_config_path(), Path("/somewhere/else.json"))
+
+    def test_the_example_is_committed_and_loadable(self):
+        self.assertTrue(stranded.EXAMPLE_CONFIG.exists())
+        json.loads(stranded.EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+
+    def test_a_local_config_json_is_usable_if_it_exists(self):
+        """Guards the developer's own copy without asserting what is in it."""
+        if not stranded.DEFAULT_CONFIG.exists():
+            self.skipTest("no local config.json")
+        with patch.object(stranded, "CONFIG_FILE", stranded.DEFAULT_CONFIG):
+            for entry in stranded.models():
+                self.assertTrue(entry["name"] and entry["id"])
+                self.assertIsInstance(entry.get("reasoning", []), list)
+            stranded.AgentConfig()
 
 
 class AgentTests(unittest.TestCase):

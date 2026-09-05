@@ -34,6 +34,7 @@ access.
 - `stranded_web.py` — the local browser interface
 - `stranded_tools.py` — planning, goal, search, and web extraction tools
 - `config.json` — the models on offer, each with its endpoint and reasoning levels
+  (yours, untracked; `config.json.example` is the committed starting point)
 - `skills/` — project-local skills, one skill per subdirectory
 - `skills/_builtin/` — framework-provided skill instructions
 - `tools/` — project-local helper scripts added to the command path
@@ -53,6 +54,14 @@ python stranded.py
 python stranded_web.py
 ```
 
+Both run straight from a fresh clone. To change the models on offer, take your own
+copy of the catalogue first — `config.json` is ignored by git, so your edits survive
+a `git pull`:
+
+```text
+cp config.json.example config.json
+```
+
 Run the test suite from the project root:
 
 ```text
@@ -60,13 +69,22 @@ python -m unittest discover -s tests -v
 ```
 
 The tests use a scripted Strands model provider, so they exercise the real agent loop,
-tool executor, and approval path without a network call or an API key.
+tool executor, and approval path without a network call or an API key. They read
+`config.json.example` rather than your `config.json`, so editing your own catalogue
+cannot break them — one test does check that your `config.json` is loadable, when
+you have one.
 
 ## Configuration
 
-Models live in [`config.json`](config.json), and **each model names its own
-endpoint**. Both interfaces read the file, so the terminal and the browser always
-offer the same choices, and adding a model never touches the code.
+Models live in `config.json`, and **each model names its own endpoint**. Both
+interfaces read the file, so the terminal and the browser always offer the same
+choices, and adding a model never touches the code.
+
+`config.json` is yours and is not in version control.
+[`config.json.example`](config.json.example) is the committed copy, and STRANDed
+reads it when you have no `config.json` — so a fresh clone runs without setup, and
+your own catalogue is never clobbered by a pull. `STRANDED_CONFIG` overrides both,
+and is an error if it points at a file that is not there.
 
 ```json
 {
@@ -79,8 +97,9 @@ offer the same choices, and adding a model never touches the code.
 }
 ```
 
-`python stranded.py --list` prints what is on offer. Omit `base_url` (or leave it
-`null`) to use the OpenAI client's default. A model with an empty `reasoning` list
+`python stranded.py --list` prints what is on offer, and names the file it read.
+Omit `base_url` (or leave it `null`) to use the OpenAI client's default. A model
+with an empty `reasoning` list
 is sent no `reasoning_effort` at all, which is what models that reject the argument
 need. Keys beginning with `_` are ignored, so `_note` is a place for comments.
 

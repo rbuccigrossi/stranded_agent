@@ -12,6 +12,18 @@ import stranded_web
 from tests.scripted_model import ScriptedModel, text_turn, tool_turn
 
 
+def setUpModule():
+    """Run against the committed example, not whatever is in the developer's config.json."""
+    global _example
+    _example = patch.object(stranded, "CONFIG_FILE", stranded.EXAMPLE_CONFIG)
+    _example.start()
+
+
+def tearDownModule():
+    _example.stop()
+
+
+
 class WebServerTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
