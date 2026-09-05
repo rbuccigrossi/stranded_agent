@@ -5,6 +5,10 @@ STRANDed is a small, single-user agent harness built on the
 the point: it is *stranded* on purpose, kept as thin as an agent can be while still
 being genuinely useful, so the whole system stays easy to read in one sitting.
 
+It speaks the OpenAI **Chat Completions** API, so plain OpenAI and an
+OpenAI-compatible gateway such as APISIX are the same code path with a different
+entry in `config.json` -- including a gateway that gives each model its own route.
+
 Strands supplies the parts every agent needs — the agent loop, tool schemas, model
 providers, streaming, skills, approval interventions, and turn limits. STRANDed adds
 only what is specific to this project: a shell tool, planning and goal tools, public
@@ -29,6 +33,7 @@ access.
 - `stranded.py` — the terminal agent, and the harness the web UI calls into
 - `stranded_web.py` — the local browser interface
 - `stranded_tools.py` — planning, goal, search, and web extraction tools
+- `config.json` — the models on offer, each with its endpoint and reasoning levels
 - `skills/` — project-local skills, one skill per subdirectory
 - `skills/_builtin/` — framework-provided skill instructions
 - `tools/` — project-local helper scripts added to the command path
@@ -59,21 +64,101 @@ tool executor, and approval path without a network call or an API key.
 
 ## Configuration
 
-The default model is `5.6 Luna` with `Light` reasoning, reached through Strands'
-OpenAI Responses provider. Model, reasoning, and approval mode can be set from the
-command line, the web interface, or the environment:
+Models live in [`config.json`](config.json), and **each model names its own
+endpoint**. Both interfaces read the file, so the terminal and the browser always
+offer the same choices, and adding a model never touches the code.
+
+```json
+{
+  "default_model": "GPT 5.6 Luna",
+  "models": [
+    {"name": "GPT 5.6 Luna", "id": "gpt-5.6-luna", "base_url": null,
+     "reasoning": ["none", "low", "medium", "high", "xhigh"],
+     "default_reasoning": "none"}
+  ]
+}
+```
+
+`python stranded.py --list` prints what is on offer. Omit `base_url` (or leave it
+`null`) to use the OpenAI client's default. A model with an empty `reasoning` list
+is sent no `reasoning_effort` at all, which is what models that reject the argument
+need. Keys beginning with `_` are ignored, so `_note` is a place for comments.
 
 | Flag | Environment variable | Values |
 | --- | --- | --- |
-| `--model` | `STRANDED_MODEL` | any model id the provider accepts |
-| `--provider` | `STRANDED_PROVIDER` | `openai`, `anthropic`, `bedrock`, `gemini`, `ollama` |
-| `--reasoning` | `STRANDED_REASONING` | `Light`, `Medium`, `Heavy` |
+| `--model` | `STRANDED_MODEL` | a model name from `config.json` |
+| `--reasoning` | `STRANDED_REASONING` | a level that model allows |
 | `--approval` | `STRANDED_APPROVAL` | `ask`, `all`, `deny` |
+| `--list` | | print the catalogue and exit |
+| | `STRANDED_CONFIG` | path to a different config.json |
+| | `OPENAI_API_KEY` | bearer token; behind a gateway, the gateway's own credential |
 | | `STRANDED_MAX_STEPS` | turns allowed in one invocation (default 200) |
 | | `STRANDED_MAX_GOAL_ITERATIONS` | unprompted goal continuations (default 5) |
 
 `-c` continues the most recent session in this directory and `-s` picks one from a
 list.
+
+### Gateways with one route per model
+
+Endpoints belong to models rather than the other way round, because a gateway such
+as APISIX commonly exposes a separate route for each model. Choosing the model
+chooses the endpoint, and there is no second thing to pick:
+
+```json
+{
+  "default_model": "Luna via APISIX",
+  "models": [
+    {"name": "Luna via APISIX", "id": "gpt-5.6-luna",
+     "base_url": "https://gateway.example/llm/luna/v1",
+     "reasoning": ["none", "low", "medium", "high", "xhigh"],
+     "default_reasoning": "medium"},
+    {"name": "Sol via APISIX", "id": "gpt-5.6-sol",
+     "base_url": "https://gateway.example/llm/sol/v1",
+     "reasoning": ["none", "low", "medium", "high", "xhigh"],
+     "default_reasoning": "high"}
+  ]
+}
+```
+
+Models from different gateways, or a mix of gateway and direct models, can sit side
+by side in the same list. Set `OPENAI_API_KEY` to the gateway's token. If the
+gateway wants its own auth header rather than a bearer token, the OpenAI client
+reads `OPENAI_CUSTOM_HEADERS` as newline-separated `Name: value` pairs:
+
+```bash
+export OPENAI_CUSTOM_HEADERS="apikey: your-consumer-key"
+```
+
+Each `base_url` must include whatever prefix `/chat/completions` gets appended to.
+
+### What reasoning levels actually work
+
+The shipped levels are what the **live API** reports, which is narrower than the
+GPT-5.6 model pages. Those pages list `max`; the API refuses it:
+
+```text
+400 - Unsupported value: 'reasoning_effort' does not support 'max' with this model.
+Supported values are: 'none', 'low', 'medium', 'high', and 'xhigh'.
+```
+
+`minimal` is refused the same way. Both Luna and Sol report the identical set.
+
+There is a second, undocumented restriction that matters more here. On
+`/v1/chat/completions`, **any effort above `none` is rejected while function tools
+are present**:
+
+```text
+400 - Function tools with reasoning_effort are not supported for gpt-5.6-luna in
+/v1/chat/completions. To use function tools, use /v1/responses or set
+reasoning_effort to 'none'.
+```
+
+This agent always has tools, so against OpenAI's own endpoint `none` is currently
+the only level that works — which is why it is the shipped `default_reasoning`. The
+same levels may well work through a gateway that routes to `/v1/responses`, and
+`config.json` is per-endpoint precisely so you can declare that where it is true.
+Verify against your own endpoint rather than trusting either the model pages or this
+paragraph.
 
 ## How it works
 
@@ -97,9 +182,8 @@ list.
   `agent.messages`. Both are saved as plain JSON, so a session file is readable, and
   nothing about a conversation is held server-side by the model vendor.
 
-Because history is local rather than vendor-held, changing providers is a flag rather
-than a rewrite — every entry in `PROVIDERS` satisfies the same Strands `Model`
-interface.
+Because history is local rather than vendor-held, pointing STRANDed at a different
+endpoint is a config entry rather than a rewrite.
 
 Shell execution, web searches, and web fetches follow the approval mode. Plans and
 goals are local framework state and do not require approval. STRANDed reports tool
@@ -107,7 +191,8 @@ calls, reasoning summaries, plans, goals, and web sources as they occur.
 
 ## Lineage
 
-STRANDed is the successor to Solith, which spoke to the OpenAI Responses API directly.
+STRANDed is the successor to Solith, which spoke to the OpenAI Responses API directly
+with its own hand-rolled transport.
 Moving to Strands deleted the hand-written JSON tool schemas, the server-sent-event
 parser, the tool-call dispatch loop, the approval resume bookkeeping, the separate
 plan and goal state file, and every other piece of provider-specific machinery —

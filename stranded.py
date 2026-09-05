@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""STRANDed Agent: a minimal, inspectable shell agent built on the AWS Strands SDK."""
+"""STRANDed Agent: a minimal, inspectable shell agent built on the AWS Strands SDK.
+
+Talks to any OpenAI-compatible Chat Completions endpoint. Each model in config.json
+names its own endpoint, so a plain OpenAI key and a gateway such as APISIX -- which
+often exposes a separate route per model -- are the same code path.
+"""
 
 import argparse
 import asyncio
-import importlib
 import json
 import logging
 import os
@@ -17,6 +21,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from strands import Agent, tool
 from strands.interventions import Confirm, Deny, InterventionHandler, Proceed
+from strands.models.openai import OpenAIModel
 from strands.types.agent import Limits
 from strands.vended_plugins.skills import AgentSkills
 
@@ -33,27 +38,12 @@ SKILLS_DIR = ROOT_DIR / "skills"
 BUILTIN_SKILLS_DIR = SKILLS_DIR / "_builtin"
 TOOLS_DIR = ROOT_DIR / "tools"
 SESSIONS_FILE = Path(os.getenv("STRANDED_SESSIONS", str(ROOT_DIR / ".stranded_sessions.json")))
+CONFIG_FILE = Path(os.getenv("STRANDED_CONFIG", str(ROOT_DIR / "config.json")))
 
-DEFAULT_PROVIDER = "openai"
-DEFAULT_MODEL = "5.6 Luna"
-MODEL_ALIASES = {"5.6 Luna": "gpt-5.6-luna"}
-DEFAULT_REASONING = "Light"
 DEFAULT_APPROVAL = "ask"
-REASONING_LEVELS = ("Light", "Medium", "Heavy")
-REASONING_EFFORT = {"Light": "low", "Medium": "medium", "Heavy": "high"}
 APPROVAL_MODES = ("ask", "all", "deny")
 MAX_STEPS = int(os.getenv("STRANDED_MAX_STEPS", "200"))
 MAX_GOAL_ITERATIONS = int(os.getenv("STRANDED_MAX_GOAL_ITERATIONS", "5"))
-
-#: Strands ships a provider per model vendor; each one satisfies the same Model
-#: interface, so switching vendors is a flag rather than a rewrite.
-PROVIDERS = {
-    "openai": "strands.models.openai_responses.OpenAIResponsesModel",
-    "anthropic": "strands.models.anthropic.AnthropicModel",
-    "bedrock": "strands.models.bedrock.BedrockModel",
-    "gemini": "strands.models.gemini.GeminiModel",
-    "ollama": "strands.models.ollama.OllamaModel",
-}
 
 #: Tools that reach outside the conversation and therefore follow the approval mode.
 APPROVAL_TOOL_NAMES = {"execute_shell", "web_search", "web_fetch"}
@@ -66,12 +56,9 @@ GOAL_PROMPT = (
 
 _TTY = sys.stderr.isatty()
 
-#: Non-empty while the terminal is mid-way through printing a reasoning summary.
-_STREAMING_REASONING: List[bool] = []
-
-# The Responses API drops reasoning blocks when replaying history, and says so on
+# Reasoning blocks are dropped when history is replayed, and the provider says so on
 # every request. That is expected here, so keep it out of the transcript.
-logging.getLogger("strands.models.openai_responses").setLevel(logging.ERROR)
+logging.getLogger("strands.models.openai").setLevel(logging.ERROR)
 
 
 def ensure_environment() -> None:
@@ -93,26 +80,67 @@ def color(code: int, value: str) -> str:
     return f"\033[{code}m{value}\033[0m" if _TTY else value
 
 
+def catalog() -> Dict[str, Any]:
+    """The models on offer, read from config.json.
+
+    Both interfaces read this, so the terminal and the browser always present the
+    same choices, and adding a model never touches the code.
+    """
+    with CONFIG_FILE.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def models() -> List[Dict[str, Any]]:
+    return catalog()["models"]
+
+
+def model_entry(name: str) -> Dict[str, Any]:
+    """One model's id, endpoint, and reasoning levels, looked up by its display name."""
+    offered = models()
+    for entry in offered:
+        if entry["name"] == name:
+            return entry
+    names = ", ".join(item["name"] for item in offered)
+    raise ValueError(f"unknown model {name!r}; config.json offers: {names}")
+
+
 @dataclass(frozen=True)
 class AgentConfig:
-    """Everything the user can change about a run."""
+    """Everything the user can change about a run, validated against config.json.
 
-    model: str = DEFAULT_MODEL
-    reasoning: str = DEFAULT_REASONING
+    Empty fields fall back to the catalogue's default, so ``AgentConfig()`` is
+    always the configured default.
+    """
+
+    model: str = ""
+    reasoning: Optional[str] = None
     approval_mode: str = DEFAULT_APPROVAL
-    provider: str = DEFAULT_PROVIDER
     max_steps: int = MAX_STEPS
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "model", self.model.strip() or DEFAULT_MODEL)
-        for value, allowed, label in ((self.reasoning, REASONING_LEVELS, "reasoning"),
-                                      (self.approval_mode, APPROVAL_MODES, "approval"),
-                                      (self.provider, tuple(PROVIDERS), "provider")):
-            if str(value).strip().lower() not in {item.lower() for item in allowed}:
-                raise ValueError(f"{label} must be one of: {', '.join(allowed)}")
-        object.__setattr__(self, "reasoning", self.reasoning.strip().title())
+        data = catalog()
+        object.__setattr__(self, "model",
+                           self.model or data.get("default_model") or data["models"][0]["name"])
+        entry = model_entry(self.model)
+        levels = entry.get("reasoning") or []
+        chosen = self.reasoning or entry.get("default_reasoning") or (levels[0] if levels else None)
+        if levels and chosen not in levels:
+            raise ValueError(f"{self.model} accepts reasoning: {', '.join(levels)}")
+        object.__setattr__(self, "reasoning", chosen if levels else None)
         object.__setattr__(self, "approval_mode", self.approval_mode.strip().lower())
-        object.__setattr__(self, "provider", self.provider.strip().lower())
+        if self.approval_mode not in APPROVAL_MODES:
+            raise ValueError(f"approval must be one of: {', '.join(APPROVAL_MODES)}")
+
+
+def env_config(**overrides: Any) -> AgentConfig:
+    """Build a configuration from the environment, with non-empty overrides on top."""
+    settings: Dict[str, Any] = {
+        "model": os.getenv("STRANDED_MODEL", ""),
+        "reasoning": os.getenv("STRANDED_REASONING"),
+        "approval_mode": os.getenv("STRANDED_APPROVAL", DEFAULT_APPROVAL),
+    }
+    settings.update({key: value for key, value in overrides.items() if value is not None})
+    return AgentConfig(**settings)
 
 
 @dataclass
@@ -128,6 +156,7 @@ class Turn:
 
 
 def api_key() -> str:
+    """The bearer token. Behind a gateway this is the gateway's own credential."""
     key = os.getenv("OPENAI_API_KEY") or os.getenv("OPEN_API_KEY")
     if not key:
         raise RuntimeError("set OPENAI_API_KEY (or OPEN_API_KEY)")
@@ -193,19 +222,22 @@ def tool_detail(name: str, args: Dict[str, Any]) -> str:
     return name
 
 
+#: Tool name -> the key to read out of its JSON result, and the event to raise for it.
+RESULT_EVENTS = {"create_plan": ("plan", "plan_update"), "update_plan": ("plan", "plan_update"),
+                 "create_goal": ("goal", "goal_update"), "get_goal": ("goal", "goal_update"),
+                 "update_goal": ("goal", "goal_update"), "web_search": ("sources", "web_sources"),
+                 "web_fetch": ("sources", "web_sources")}
+
+
 def tool_events(name: str, result: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Turn a finished tool result into the plan, goal, and source events the UIs show."""
-    keys = {"create_plan": ("plan", "plan_update"), "update_plan": ("plan", "plan_update"),
-            "create_goal": ("goal", "goal_update"), "get_goal": ("goal", "goal_update"),
-            "update_goal": ("goal", "goal_update"), "web_search": ("sources", "web_sources"),
-            "web_fetch": ("sources", "web_sources")}
-    if name not in keys or not result:
+    if name not in RESULT_EVENTS or not result:
         return []
     try:
         payload = json.loads("".join(block.get("text", "") for block in result.get("content", [])))
     except (json.JSONDecodeError, AttributeError):
         return []
-    key, event_type = keys[name]
+    key, event_type = RESULT_EVENTS[name]
     return [{"type": event_type, key: payload.get(key), "explanation": payload.get("explanation", "")}]
 
 
@@ -247,23 +279,26 @@ class Approval(InterventionHandler):
         return Proceed()
 
 
-def build_model(config: AgentConfig) -> Any:
-    """Instantiate the Strands model provider named by the configuration."""
-    module_name, _, class_name = PROVIDERS[config.provider].rpartition(".")
-    model_class = getattr(importlib.import_module(module_name), class_name)
-    kwargs: Dict[str, Any] = {"model_id": MODEL_ALIASES.get(config.model, config.model)}
-    if config.provider == "openai":
-        kwargs["client_args"] = {"api_key": api_key()}
-        kwargs["params"] = {"reasoning": {"effort": REASONING_EFFORT[config.reasoning],
-                                          "summary": "auto"}}
-    return model_class(**kwargs)
+def build_model(config: AgentConfig) -> OpenAIModel:
+    """Point the Chat Completions client at the endpoint this model declares.
+
+    Each model carries its own ``base_url``, because a gateway commonly exposes one
+    route per model; omit it to use the OpenAI client's default. A model with no
+    reasoning levels is sent no ``reasoning_effort`` at all, which is what models
+    that reject the argument need.
+    """
+    entry = model_entry(config.model)
+    client_args: Dict[str, Any] = {"api_key": api_key()}
+    if entry.get("base_url"):
+        client_args["base_url"] = entry["base_url"]
+    return OpenAIModel(client_args=client_args, model_id=entry["id"],
+                       params={"reasoning_effort": config.reasoning} if config.reasoning else {})
 
 
 def build_agent(config: AgentConfig, messages: Optional[List[Dict[str, Any]]] = None,
                 state: Optional[Dict[str, Any]] = None,
                 on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
-                ask: Optional[Callable[[str, Dict[str, Any]], bool]] = None,
-                ) -> Agent:
+                ask: Optional[Callable[[str, Dict[str, Any]], bool]] = None) -> Agent:
     """Build an agent, resuming from a previously saved message history and state.
 
     The approval handler is kept on ``agent.approval`` because it is also this
@@ -393,8 +428,7 @@ def save_session(agent: Agent, label: str, config: AgentConfig) -> None:
                 if not (session.get("label") == label and session.get("cwd") == os.getcwd())]
     sessions.append({"label": label[:80], "cwd": os.getcwd(), "ts": int(time.time()),
                      "model": config.model, "reasoning": config.reasoning,
-                     "provider": config.provider, "messages": agent.messages,
-                     "state": agent.state.get()})
+                     "messages": agent.messages, "state": agent.state.get()})
     SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
     with SESSIONS_FILE.open("w", encoding="utf-8") as handle:
         json.dump(sessions[-50:], handle, indent=2, default=str)
@@ -444,20 +478,24 @@ def terminal_approval(config: AgentConfig) -> Callable[[str, Dict[str, Any]], bo
     return ask
 
 
+_reasoning_open = False
+
+
 def cli_event(event: Dict[str, Any]) -> None:
     """Render one harness event on the terminal.
 
-    Reasoning arrives token by token, so the label is printed once and the rest of
-    the summary streams in after it.
+    Reasoning, where a model emits it, arrives token by token; the label is printed
+    once and the rest of the summary streams in after it.
     """
+    global _reasoning_open
     kind = event["type"]
     if kind == "reasoning_delta":
-        if not _STREAMING_REASONING:
+        if not _reasoning_open:
             print(f"\n{color(90, '[reasoning] ')}", end="", file=sys.stderr, flush=True)
-            _STREAMING_REASONING.append(True)
+            _reasoning_open = True
         print(color(90, event["text"]), end="", file=sys.stderr, flush=True)
         return
-    _STREAMING_REASONING.clear()
+    _reasoning_open = False
     if kind == "tool_call":
         print(f"\n{color(90, '[tool] ' + event['name'])}", file=sys.stderr)
         print(color(32, tool_detail(event["name"], event.get("arguments", {}))), file=sys.stderr)
@@ -510,20 +548,39 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("-c", "--continue", dest="continue_session", action="store_true",
                         help="continue the most recent session")
     parser.add_argument("-s", "--session", action="store_true", help="pick a saved session")
-    parser.add_argument("--model", default=os.getenv("STRANDED_MODEL", DEFAULT_MODEL))
-    parser.add_argument("--provider", default=os.getenv("STRANDED_PROVIDER", DEFAULT_PROVIDER),
-                        choices=sorted(PROVIDERS))
-    parser.add_argument("--reasoning", default=os.getenv("STRANDED_REASONING", DEFAULT_REASONING),
-                        choices=REASONING_LEVELS, type=lambda value: value.title())
-    parser.add_argument("--approval", default=os.getenv("STRANDED_APPROVAL", DEFAULT_APPROVAL),
-                        choices=APPROVAL_MODES)
+    parser.add_argument("--model", help="model name from config.json (env STRANDED_MODEL)")
+    parser.add_argument("--reasoning", help="reasoning effort the model allows "
+                                            "(env STRANDED_REASONING)")
+    parser.add_argument("--approval", choices=APPROVAL_MODES,
+                        help=f"tool approval mode (default {DEFAULT_APPROVAL}; "
+                             "env STRANDED_APPROVAL)")
+    parser.add_argument("--list", action="store_true", help="show config.json and exit")
     parser.add_argument("prompt", nargs="*")
     return parser.parse_args(argv)
 
 
+def print_catalog() -> None:
+    """Show what config.json offers, so --model and --reasoning can be typed correctly."""
+    default = AgentConfig().model
+    for entry in models():
+        marker = "  (default)" if entry["name"] == default else ""
+        levels = ", ".join(entry.get("reasoning") or []) or "no reasoning setting"
+        print(f"{color(1, entry['name'])}{marker}")
+        print(f"  {color(90, entry['id'])} at "
+              f"{entry.get('base_url') or 'https://api.openai.com/v1'}")
+        print(f"  reasoning: {levels}")
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv)
-    config = AgentConfig(args.model, args.reasoning, args.approval, args.provider)
+    if args.list:
+        print_catalog()
+        return
+    try:
+        config = env_config(model=args.model, reasoning=args.reasoning,
+                            approval_mode=args.approval)
+    except (ValueError, OSError, json.JSONDecodeError) as error:
+        raise SystemExit(f"{error}\n(see {CONFIG_FILE}, or run --list)")
     session: Dict[str, Any] = {}
     if args.session or args.continue_session:
         session = pick_session() if args.session else next(

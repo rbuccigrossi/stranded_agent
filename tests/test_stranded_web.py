@@ -95,6 +95,33 @@ class WebServerTests(unittest.TestCase):
         self.assertEqual(response.status, 404)
         connection.close()
 
+    def test_catalog_is_served_for_the_dropdowns(self):
+        served = self.get("/api/catalog")
+        self.assertEqual(served, stranded.catalog())
+        luna = served["models"][0]
+        self.assertEqual(luna["name"], "GPT 5.6 Luna")
+        self.assertIn("xhigh", luna["reasoning"])
+
+    def test_browser_choices_are_validated_and_stored(self):
+        with self.scripted(text_turn("done")):
+            self.post("/api/chat", {"prompt": "hi", "config": {
+                "model": "GPT 5.6 Sol", "reasoning": "high", "approval": "deny"}})
+        stored = next(iter(stranded_web.SESSIONS.values()))["config"]
+        self.assertEqual(stored, {"model": "GPT 5.6 Sol",
+                                  "reasoning": "high", "approval": "deny"})
+        self.assertEqual(stored, self.get("/api/sessions")[0]["config"])
+
+    def test_a_rejected_choice_returns_400(self):
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=20)
+        connection.request("POST", "/api/chat", json.dumps(
+            {"prompt": "hi", "config": {"model": "GPT 5.6 Sol", "reasoning": "max"}}),
+            {"Content-Type": "application/json"})
+        response = connection.getresponse()
+        body = response.read().decode("utf-8")
+        connection.close()
+        self.assertEqual(response.status, 400)
+        self.assertIn("accepts reasoning", body)
+
     def test_page_renders_the_stranded_name_and_event_handlers(self):
         connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=20)
         connection.request("GET", "/")
@@ -102,6 +129,8 @@ class WebServerTests(unittest.TestCase):
         connection.close()
         self.assertIn("<title>STRANDed Agent</title>", page)
         for fragment in ("function scrollChat()", "function showToolCall(call)",
+                         "function loadCatalog()", "function syncReasoning(chosen)",
+                         'id="model"', 'id="reasoning"',
                          "function showPlan(plan)", "function showGoal(goal)",
                          "function showSources(sources)", "insertBefore(d,x.body)",
                          "insertBefore(box,x.body)", "min-height:0", "overflow-y:auto"):

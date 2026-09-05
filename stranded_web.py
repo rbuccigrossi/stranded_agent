@@ -47,6 +47,12 @@ def save_sessions() -> None:
             json.dump(ordered, handle, indent=2, default=str)
 
 
+def session_config(config: stranded.AgentConfig) -> Dict[str, Any]:
+    """The configuration fields the browser shows and sends back."""
+    return {"model": config.model, "reasoning": config.reasoning,
+            "approval": config.approval_mode}
+
+
 def new_session() -> Dict[str, Any]:
     now = int(time.time())
     session = {
@@ -54,8 +60,7 @@ def new_session() -> Dict[str, Any]:
         "label": "New chat",
         "created": now,
         "updated": now,
-        "config": {"model": stranded.DEFAULT_MODEL, "reasoning": stranded.DEFAULT_REASONING,
-                   "approval": stranded.DEFAULT_APPROVAL},
+        "config": session_config(stranded.env_config()),
         "messages": [],
         "state": {},
     }
@@ -75,12 +80,12 @@ def session_view(session: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def config_from_payload(payload: Dict[str, Any], session: Dict[str, Any]) -> stranded.AgentConfig:
+    """Validate the browser's choices against config.json, falling back to the environment."""
     incoming = {**(session.get("config") or {}), **(payload.get("config") or {})}
-    config = stranded.AgentConfig(model=str(incoming.get("model", stranded.DEFAULT_MODEL)),
-                                  reasoning=str(incoming.get("reasoning", stranded.DEFAULT_REASONING)),
-                                  approval_mode=str(incoming.get("approval", stranded.DEFAULT_APPROVAL)))
-    session["config"] = {"model": config.model, "reasoning": config.reasoning,
-                         "approval": config.approval_mode}
+    config = stranded.env_config(model=incoming.get("model"),
+                                 reasoning=incoming.get("reasoning"),
+                                 approval_mode=incoming.get("approval"))
+    session["config"] = session_config(config)
     return config
 
 
@@ -116,9 +121,14 @@ button,input,select{font:inherit;color:inherit}button{border:1px solid var(--lin
 @media(max-width:700px){.layout{grid-template-columns:1fr}.side{display:none}.top{padding:10px}.chat,.composer{padding-left:12px;padding-right:12px}.token{width:100%;margin-left:0}}
 </style></head>
 <body><div class="layout"><aside class="side"><div class="brand">STRANDed</div><button class="new" id="new">＋ New chat</button><div class="sessions" id="sessions"></div><div class="hint">Single-thread local UI<br>Tool approval stays in your hands.</div></aside>
-<main class="main"><header class="top"><div class="control"><label for="model">model</label><input id="model" class="model" value="5.6 Luna"></div><div class="control"><label for="reasoning">reasoning</label><select id="reasoning"><option>Light</option><option>Medium</option><option>Heavy</option></select></div><div class="control"><label for="approval">approval</label><select id="approval"><option value="ask">Ask</option><option value="all">All</option><option value="deny">Deny</option></select></div><div class="token" id="tokens">tokens: 0</div></header><section class="chat" id="chat"><div class="empty" id="empty">Start a conversation with the STRANDed Agent.</div></section><form class="composer" id="composer"><textarea id="prompt" placeholder="Message the agent…" autofocus></textarea><button id="send">Send</button></form></main></div>
+<main class="main"><header class="top"><div class="control"><label for="model">model</label><select id="model" class="model"></select></div><div class="control"><label for="reasoning">reasoning</label><select id="reasoning"></select></div><div class="control"><label for="approval">approval</label><select id="approval"><option value="ask">Ask</option><option value="all">All</option><option value="deny">Deny</option></select></div><div class="token" id="tokens">tokens: 0</div></header><section class="chat" id="chat"><div class="empty" id="empty">Start a conversation with the STRANDed Agent.</div></section><form class="composer" id="composer"><textarea id="prompt" placeholder="Message the agent…" autofocus></textarea><button id="send">Send</button></form></main></div>
 <script>
-const $=id=>document.getElementById(id);let activeId=null,assistant=null,pendingId=null;
+const $=id=>document.getElementById(id);let activeId=null,assistant=null,pendingId=null,catalog={models:[]};
+function fill(select,values,chosen){select.replaceChildren(...values.map(v=>{const o=document.createElement('option');o.value=o.textContent=v;return o}));if(values.includes(chosen))select.value=chosen}
+function syncReasoning(chosen){const m=(catalog.models||[]).find(x=>x.name===$('model').value)||{};const levels=m.reasoning||[];fill($('reasoning'),levels,chosen||m.default_reasoning);$('reasoning').disabled=!levels.length}
+function syncModels(model,reasoning){fill($('model'),(catalog.models||[]).map(m=>m.name),model);syncReasoning(reasoning)}
+async function loadCatalog(){catalog=await (await fetch('/api/catalog')).json();syncModels(catalog.default_model)}
+function applyConfig(c){syncModels(c.model,c.reasoning);$('approval').value=c.approval}
 function scrollChat(){requestAnimationFrame(()=>{$('chat').scrollTop=$('chat').scrollHeight})}
 function showToolCall(call){assistant=null;if($('empty'))$('empty').remove();const box=document.createElement('div');box.className='small';box.textContent='Tool: '+(call.detail||call.name||'unknown');$('chat').append(box);scrollChat()}
 function showPlan(plan){assistant=null;if($('empty'))$('empty').remove();const box=document.createElement('details');box.className='reasoning';box.open=true;const s=document.createElement('summary');s.textContent='Plan update';box.append(s,...(plan||[]).map(x=>{const d=document.createElement('div');d.textContent=(x.status==='completed'?'✓ ':x.status==='in_progress'?'→ ':'○ ')+(x.step||'');return d}));$('chat').append(box);scrollChat()}
@@ -129,7 +139,7 @@ function showReasoning(x,text){let d=x.box.querySelector('.reasoning');if(!d){d=
 function renderMessage(m){const x=addMessage(m.role,m.content||'');if(m.reasoning)showReasoning(x,m.reasoning);return x}
 function renderSessions(items){$('sessions').replaceChildren(...items.map(s=>{const b=document.createElement('button');b.className='session'+(s.id===activeId?' active':'');b.textContent=s.label||'New chat';b.onclick=()=>openSession(s.id);return b}))}
 async function loadSessions(){const r=await fetch('/api/sessions');renderSessions(await r.json())}
-async function openSession(id){const r=await fetch('/api/sessions/'+id);const s=await r.json();activeId=id;assistant=null;pendingId=null;$('chat').replaceChildren();s.messages.forEach(renderMessage);$('model').value=s.config.model;$('reasoning').value=s.config.reasoning;$('approval').value=s.config.approval;loadSessions()}
+async function openSession(id){const r=await fetch('/api/sessions/'+id);const s=await r.json();activeId=id;assistant=null;pendingId=null;$('chat').replaceChildren();s.messages.forEach(renderMessage);applyConfig(s.config);loadSessions()}
 async function newChat(){const r=await fetch('/api/new',{method:'POST'});const s=await r.json();await openSession(s.id)}
 function startAssistant(){if(!assistant)assistant=addMessage('assistant','');return assistant}
 function showApproval(a){const x=startAssistant();const box=document.createElement('div');box.className='approval';const p=document.createElement('div');p.textContent='Approval required';const c=document.createElement('code');c.textContent=a.detail||'';const yes=document.createElement('button');yes.textContent='Approve';const no=document.createElement('button');no.textContent='Deny';yes.onclick=()=>decide(true,box);no.onclick=()=>decide(false,box);box.append(p,c,yes,no);x.box.insertBefore(box,x.body);scrollChat()}
@@ -160,7 +170,8 @@ if(reader.cancel)await reader.cancel();
 $('send').disabled=false;$('prompt').focus()
 }
 $('composer').onsubmit=e=>{e.preventDefault();const p=$('prompt').value.trim();if(!p)return;addMessage('user',p);$('prompt').value='';stream('/api/chat',{session_id:activeId,prompt:p,config:{model:$('model').value,reasoning:$('reasoning').value,approval:$('approval').value}})};
-$('new').onclick=newChat;$('prompt').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('composer').requestSubmit()}};loadSessions();
+$('model').onchange=()=>syncReasoning();
+$('new').onclick=newChat;$('prompt').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('composer').requestSubmit()}};loadCatalog().then(loadSessions);
 </script></body></html>'''
 
 
@@ -196,6 +207,8 @@ class StrandedHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif path == "/api/catalog":
+            self.send_json(stranded.catalog())
         elif path == "/api/sessions":
             items = sorted(SESSIONS.values(), key=lambda item: item.get("updated", 0), reverse=True)
             self.send_json([session_summary(item) for item in items])

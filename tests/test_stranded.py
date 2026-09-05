@@ -1,3 +1,5 @@
+import contextlib
+import json
 import os
 import tempfile
 import unittest
@@ -7,6 +9,16 @@ from unittest.mock import patch
 import stranded
 import stranded_tools
 from tests.scripted_model import ScriptedModel, text_turn, tool_turn
+
+
+@contextlib.contextmanager
+def catalog_of(data):
+    """Run the block against a config.json written just for this test."""
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "config.json"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        with patch.object(stranded, "CONFIG_FILE", path):
+            yield
 
 
 def scripted_agent(config: stranded.AgentConfig, *turns, **kwargs) -> stranded.Agent:
@@ -19,33 +31,81 @@ def scripted_agent(config: stranded.AgentConfig, *turns, **kwargs) -> stranded.A
 
 
 class ConfigTests(unittest.TestCase):
-    def test_defaults(self):
+    def test_defaults_come_from_the_catalog(self):
         config = stranded.AgentConfig()
-        self.assertEqual(config.model, "5.6 Luna")
-        self.assertEqual(config.reasoning, "Light")
+        self.assertEqual(config.model, "GPT 5.6 Luna")
+        self.assertEqual(config.reasoning, "none")
         self.assertEqual(config.approval_mode, "ask")
-        self.assertEqual(config.provider, "openai")
 
-    def test_invalid_values_are_rejected(self):
-        for kwargs in ({"reasoning": "Blazing"}, {"approval_mode": "maybe"},
-                       {"provider": "nowhere"}):
-            with self.assertRaises(ValueError):
-                stranded.AgentConfig(**kwargs)
+    def test_shipped_catalog_matches_the_live_api(self):
+        entries = {entry["name"]: entry for entry in stranded.models()}
+        self.assertEqual(sorted(entries), ["GPT 5.6 Luna", "GPT 5.6 Sol"])
+        self.assertEqual(entries["GPT 5.6 Luna"]["id"], "gpt-5.6-luna")
+        self.assertEqual(entries["GPT 5.6 Sol"]["id"], "gpt-5.6-sol")
+        for entry in entries.values():
+            self.assertEqual(entry["reasoning"], ["none", "low", "medium", "high", "xhigh"])
 
-    def test_openai_provider_is_wired_for_the_default_model(self):
+    def test_every_offered_level_is_accepted(self):
+        for level in ["none", "low", "medium", "high", "xhigh"]:
+            with self.subTest(level=level):
+                config = stranded.AgentConfig(model="GPT 5.6 Sol", reasoning=level)
+                with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+                    model = stranded.build_model(config)
+                self.assertEqual(model.get_config()["params"], {"reasoning_effort": level})
+
+    def test_unknown_model_and_level_are_rejected_by_name(self):
+        with self.assertRaisesRegex(ValueError, "unknown model"):
+            stranded.AgentConfig(model="GPT 5.6 Terra")
+        with self.assertRaisesRegex(ValueError, "accepts reasoning"):
+            stranded.AgentConfig(reasoning="max")
+        with self.assertRaisesRegex(ValueError, "approval must be"):
+            stranded.AgentConfig(approval_mode="maybe")
+
+    def test_model_id_and_effort_reach_the_chat_completions_client(self):
+        config = stranded.AgentConfig(model="GPT 5.6 Sol", reasoning="high")
         with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
-            model = stranded.build_model(stranded.AgentConfig(reasoning="Heavy"))
-        config = model.get_config()
-        self.assertEqual(config["model_id"], "gpt-5.6-luna")
-        self.assertEqual(config["params"]["reasoning"], {"effort": "high", "summary": "auto"})
-        self.assertEqual(type(model).__name__, "OpenAIResponsesModel")
+            model = stranded.build_model(config)
+        self.assertEqual(type(model).__name__, "OpenAIModel")
+        self.assertEqual(model.get_config()["model_id"], "gpt-5.6-sol")
+        self.assertEqual(model.get_config()["params"], {"reasoning_effort": "high"})
+        self.assertEqual(model.client_args, {"api_key": "test-key"})
 
-    def test_every_provider_target_is_importable(self):
-        for name in stranded.PROVIDERS:
-            with self.subTest(provider=name):
-                module, _, class_name = stranded.PROVIDERS[name].rpartition(".")
-                self.assertTrue(module.startswith("strands.models."))
-                self.assertTrue(class_name.endswith("Model"))
+    def test_each_model_carries_its_own_endpoint(self):
+        """The gateway case: one route per model, selected by picking the model."""
+        gateway = {"default_model": "Luna via APISIX", "models": [
+            {"name": "Luna via APISIX", "id": "gpt-5.6-luna",
+             "base_url": "https://gw.example/luna/v1",
+             "reasoning": ["none", "high"], "default_reasoning": "high"},
+            {"name": "Sol via APISIX", "id": "gpt-5.6-sol",
+             "base_url": "https://gw.example/sol/v1", "reasoning": []}]}
+        with catalog_of(gateway), patch.dict(os.environ, {"OPENAI_API_KEY": "gw-token"}):
+            luna = stranded.build_model(stranded.AgentConfig())
+            sol = stranded.build_model(stranded.AgentConfig(model="Sol via APISIX"))
+            self.assertEqual(stranded.AgentConfig().reasoning, "high")
+            # A model with no reasoning levels is sent no reasoning_effort at all.
+            self.assertIsNone(stranded.AgentConfig(model="Sol via APISIX").reasoning)
+        self.assertEqual(luna.client_args["base_url"], "https://gw.example/luna/v1")
+        self.assertEqual(sol.client_args["base_url"], "https://gw.example/sol/v1")
+        self.assertEqual(luna.get_config()["params"], {"reasoning_effort": "high"})
+        self.assertEqual(sol.get_config()["params"], {})
+
+    def test_a_model_without_base_url_uses_the_client_default(self):
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+            model = stranded.build_model(stranded.AgentConfig())
+        self.assertNotIn("base_url", model.client_args)
+
+    def test_env_config_reads_the_environment_and_honors_overrides(self):
+        environment = {"STRANDED_MODEL": "GPT 5.6 Sol", "STRANDED_REASONING": "xhigh",
+                       "STRANDED_APPROVAL": "all"}
+        with patch.dict(os.environ, environment, clear=False):
+            config = stranded.env_config()
+            self.assertEqual(config.model, "GPT 5.6 Sol")
+            self.assertEqual(config.reasoning, "xhigh")
+            self.assertEqual(config.approval_mode, "all")
+            # An explicit flag wins; a None override leaves the environment alone.
+            overridden = stranded.env_config(reasoning="high", model=None)
+            self.assertEqual(overridden.reasoning, "high")
+            self.assertEqual(overridden.model, "GPT 5.6 Sol")
 
 
 class AgentTests(unittest.TestCase):
