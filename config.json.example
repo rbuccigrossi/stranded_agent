@@ -1,0 +1,21 @@
+{
+  "_note": "Each model carries its own base_url, because a gateway commonly exposes one route per model. Omit base_url (or set it to null) to use the OpenAI client's default. The reasoning levels below are the ones the live API reports as supported, which is narrower than the model pages: 'max' and 'minimal' are refused. Note also that /v1/chat/completions rejects any effort above 'none' while function tools are present, and this agent always has tools, so 'none' is the only level that works against OpenAI directly today. A gateway that routes to /v1/responses may accept the rest. Keys beginning with _ are ignored.",
+
+  "default_model": "GPT 5.6 Luna",
+  "models": [
+    {
+      "name": "GPT 5.6 Luna",
+      "id": "gpt-5.6-luna",
+      "base_url": null,
+      "reasoning": ["none", "low", "medium", "high", "xhigh"],
+      "default_reasoning": "none"
+    },
+    {
+      "name": "GPT 5.6 Sol",
+      "id": "gpt-5.6-sol",
+      "base_url": null,
+      "reasoning": ["none", "low", "medium", "high", "xhigh"],
+      "default_reasoning": "none"
+    }
+  ]
+}
